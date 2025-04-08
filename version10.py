@@ -3,57 +3,53 @@ import time
 import os
 from datetime import datetime
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
 from rich.align import Align
-from rich.text import Text
-import requests
+import socket  # TCP socket for Salto server
 
 console = Console()
 last_status = None
-last_update_time = time.time()
 LOG_FILE = "door_status_log.txt"
 
-
-
-import time
+# TCP SALTO Server Configuration
+SALTO_SERVER_IP = "10.57.0.95"
+SALTO_SERVER_PORT = 8090
 
 def send_payload_to_salto_server(payload: str):
-    """Send the payload to the alto server with retry logic."""
-    retries = 5  
-    delay = 0.5   
+    """Send the payload to the Salto server over TCP with retry logic."""
+    retries = 5
+    delay = 0.5
     for attempt in range(retries):
         try:
-            data = {
-                "payload": payload,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            console.print(payload)
-            response = requests.post("http://10.57.0.95:8090", json=data)
-            # response = requests.post("http://10.10.1.158:8090", json=data)
+            console.print(f"[blue]Sending payload to SALTO server: {payload}[/]")
+            payload_bytes = bytes.fromhex(payload)
 
-            if response.status_code == 200:
-                console.print(f"[green]Payload sent successfully to the Salto server.[/]")
-                return
-            else:
-                console.print(f"[red]Failed to send payload. Server responded with status code: {response.status_code}[/]")
-        
-        except requests.RequestException as e:
-            console.print(f"[red]Error occurred while sending payload to Salto server: {str(e)}[/]")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2)  # Timeout for connection
+                s.connect((SALTO_SERVER_IP, SALTO_SERVER_PORT))
+                s.sendall(payload_bytes)
+
+                response = s.recv(4096)
+                console.print(f"[green]Response received from server: {response.hex()}[/]")
+                return  # Successfully sent and received response
+
+        except Exception as e:
+            console.print(f"[red]Error: {str(e)}[/]")
             if attempt < retries - 1:
                 console.print(f"[yellow]Retrying in {delay} seconds...[/]")
                 time.sleep(delay)
             else:
                 console.print("[red]Max retries exceeded. Could not send the payload.[/]")
 
-
 def build_get_lock_status_frame():
+    """Build and return the frame to get lock status."""
     stx = bytes([0x02])
-    ascii_payload = "00012100DF".encode("ascii")
+    ascii_payload = "00012100DF".encode("ascii")  # Modify as needed
     cr = bytes([0x0D])
     return stx + ascii_payload + cr
 
 def parse_response(ascii_data: str):
+    """Parse the lock status from the ASCII response."""
     global last_status
     if len(ascii_data) >= 10:
         parameter = ascii_data[6:8]
@@ -71,8 +67,8 @@ def parse_response(ascii_data: str):
             return True, current_status, status_code
     return False, None, None
 
-def print_large_text(message: str, status_code: str, ascii_response: str = "", response : str=""):
-    # Create main status panel with centered content
+def print_large_text(message: str, status_code: str, ascii_response: str = "", response: str = ""):
+    """Display the status and frame details."""
     status_content = Align.center(
         f"[green]Status: {message}\n"
         f"[yellow]Status Code: {status_code}[/]",
@@ -85,8 +81,7 @@ def print_large_text(message: str, status_code: str, ascii_response: str = "", r
         padding=(1, 2)
     )
     console.print(status_panel)
-    
-    # Create frame details panel if available
+
     if ascii_response:
         frame_content = Align.center(
             f"[white]ASCII Response: [cyan]{ascii_response}\n"
@@ -104,9 +99,7 @@ def print_large_text(message: str, status_code: str, ascii_response: str = "", r
             padding=(1, 2)
         )
         console.print(frame_panel)
-    
-    # Create ASCII payload details panel
-    if ascii_response:
+
         payload_content = Align.center(
             f"[yellow]Parameter Value:[cyan] {ascii_response[6:8]}",
             vertical="middle"
@@ -119,19 +112,21 @@ def print_large_text(message: str, status_code: str, ascii_response: str = "", r
         )
         console.print(payload_panel)
 
-
 def send_command():
+    """Read from serial port, process frame, and send to the server."""
     port = 'COM5'
     baudrate = 115200
     try:
         with serial.Serial(port, baudrate, timeout=0.1) as ser:
             frame = build_get_lock_status_frame()
             ser.write(frame)
+
             while ser.out_waiting > 0:
                 pass
 
             response = ser.readline()
 
+            # Check for valid response
             if response.startswith(b'\x02') and response.endswith(b'\r'):
                 clean_response = response[13:-1].decode('utf-8', errors='ignore')
                 if clean_response[4:6] == '05' and clean_response[0:2] == '00':
@@ -143,18 +138,16 @@ def send_command():
                         if length_in_bytes > 36:
                             print("Payload is too large, not sending to the server.")
                         else:
-                            print("Payload to send to the server:")
-                            # print(payload) 
                             send_payload_to_salto_server(payload)
                     except ValueError:
                         pass
 
+            # Handle the response from serial communication
             if response.startswith(b'\x02') and response.endswith(b'\x0D'):
                 try:
                     ascii_data = response[1:-1].decode("ascii")
                     status_changed, current_status, status_code = parse_response(ascii_data)
-                    # Extract full ASCII payload for detailed logging
-                    ascii_payload = response[1:-1].decode("ascii")
+                    ascii_payload = ascii_data
                     return {
                         'status_changed': status_changed,
                         'current_status': current_status,
@@ -177,7 +170,6 @@ def send_command():
             'ascii_payload': ""
         }
 
-    # If no valid response was processed, return a safe default
     return {
         'status_changed': False,
         'current_status': None,
@@ -186,14 +178,14 @@ def send_command():
         'ascii_payload': ""
     }
 
-
 def continuous_check():
+    """Continuously check the lock status."""
     global last_update_time
     try:
         while True:
             result = send_command()
             if not result:
-                continue  # If result is None or invalid, continue to next loop
+                continue
 
             current_time = time.time()
 
@@ -202,7 +194,7 @@ def continuous_check():
                 print_large_text(
                     result['current_status'],
                     result['status_code'],
-                    result['ascii_payload'],  
+                    result['ascii_payload'],
                     result['response'],
                 )
 
@@ -226,13 +218,15 @@ def continuous_check():
         )))
 
 def log_status(status: str, status_code: str):
-    """Log status changes to file with extended details"""
+    """Log status to file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] Status: {status} (Code: {status_code})"
     with open(LOG_FILE, 'a') as f:
         f.write(log_entry + '\n')
 
 def clear_console():
+    """Clear the console."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
-continuous_check()
+if __name__ == "__main__":
+    continuous_check()
